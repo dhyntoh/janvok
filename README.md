@@ -62,6 +62,12 @@ Atau masukkan token saat diminta. Setelah token valid, installer akan meminta in
 
 Konfigurasi akan disimpan di `INSTALLER_HOME/config.json` dan digunakan kembali.
 
+### Port Default
+
+- Xray TCP: **443**
+- Hysteria2 UDP: **443**
+- ZIVPN UDP: **5667**
+
 ### Dry Run
 
 Untuk melihat langkah instalasi tanpa mengeksekusi:
@@ -102,17 +108,32 @@ Jalankan bot:
 ./zivpn-installer bot
 ```
 
+### Systemd Bot Service
+
+Saat instalasi, bot otomatis dibuat sebagai service systemd dan dijalankan:
+
+```
+systemctl status zivpn-installer-bot.service
+```
+
 ### Perintah Admin
 
 Gunakan perintah atau menu:
 
 ```
-/create <username> <months> [limit]
+/create
 /delete <username>
 /setexp <username> <YYYY-MM-DD>
 /setlimit <username> <limit>
 /list
+/status
+/restart <zivpn|xray|hysteria2|bot>
+/backup
+/restore [file]
+/cancel
 ```
+
+Flow `/create` bersifat interaktif: bot akan menanyakan username, masa aktif (hari), lalu pilihan protocol dan mengirim link akun seperti `zi://`, `vless://`, dll.
 
 Data akun akan disimpan di `accounts.json` pada `INSTALLER_HOME`.
 

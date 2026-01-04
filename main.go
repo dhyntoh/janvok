@@ -18,6 +18,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -52,6 +53,7 @@ type AccountEntry struct {
 	Username    string    `json:"username"`
 	ExpiresAt   time.Time `json:"expires_at"`
 	DeviceLimit int       `json:"device_limit"`
+	Protocol    string    `json:"protocol"`
 }
 
 type InstallerConfig struct {
@@ -59,6 +61,17 @@ type InstallerConfig struct {
 	TelegramAdminIDs string `json:"telegram_admin_ids"`
 	XrayDomain       string `json:"xray_domain"`
 }
+
+type adminSession struct {
+	Step     string
+	Username string
+	Days     int
+}
+
+var (
+	adminSessions   = map[int64]*adminSession{}
+	adminSessionsMu sync.Mutex
+)
 
 type PortAssignments struct {
 	ZivpnPort    int
@@ -243,12 +256,14 @@ func runInstall(args []string) error {
 		return err
 	}
 
+	if err := setupBotService(); err != nil {
+		fmt.Fprintln(os.Stderr, "Gagal menyiapkan service bot:", err)
+	}
+
 	fmt.Println("Instalasi selesai. Port yang digunakan:")
 	fmt.Printf("  ZIVPN UDP: %d\n", ports.ZivpnPort)
-	fmt.Printf("  Xray VMess: %d\n", ports.VmessPort)
-	fmt.Printf("  Xray VLESS: %d\n", ports.VlessPort)
-	fmt.Printf("  Xray Trojan: %d\n", ports.TrojanPort)
-	fmt.Printf("  Hysteria2: %d\n", ports.HysteriaPort)
+	fmt.Printf("  Xray TCP: %d\n", ports.VmessPort)
+	fmt.Printf("  Hysteria2 UDP: %d\n", ports.HysteriaPort)
 	return nil
 }
 
@@ -290,6 +305,96 @@ func runUpdate(args []string) error {
 
 	fmt.Println("Update selesai.")
 	return nil
+}
+
+func setupBotService() error {
+	execPath, err := os.Executable()
+	if err != nil {
+		return err
+	}
+	servicePath := "/etc/systemd/system/zivpn-installer-bot.service"
+	unit := strings.Join([]string{
+		"[Unit]",
+		"Description=ZIVPN Installer Telegram Bot",
+		"After=network.target",
+		"",
+		"[Service]",
+		"Type=simple",
+		fmt.Sprintf("ExecStart=%s bot", execPath),
+		"Restart=always",
+		"RestartSec=3",
+		"",
+		"[Install]",
+		"WantedBy=multi-user.target",
+		"",
+	}, "\n")
+	if err := os.WriteFile(servicePath, []byte(unit), 0o644); err != nil {
+		return err
+	}
+	if err := execCommand("systemctl", "daemon-reload").Run(); err != nil {
+		return err
+	}
+	if err := execCommand("systemctl", "enable", "--now", "zivpn-installer-bot.service").Run(); err != nil {
+		return err
+	}
+	return nil
+}
+
+func createBackup() (string, error) {
+	home := installerHome()
+	backupDir := filepath.Join(home, "backups")
+	if err := os.MkdirAll(backupDir, 0o700); err != nil {
+		return "", err
+	}
+	backupPath := filepath.Join(backupDir, fmt.Sprintf("backup-%s.tar.gz", time.Now().Format("20060102-150405")))
+
+	paths := []string{home}
+	optional := []string{"/etc/zivpn", "/etc/xray", "/etc/hysteria2"}
+	for _, dir := range optional {
+		if _, err := os.Stat(dir); err == nil {
+			paths = append(paths, dir)
+		}
+	}
+
+	args := append([]string{"czf", backupPath, "--exclude", backupDir}, paths...)
+	cmd := execCommand("tar", args...)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		return "", err
+	}
+	return backupPath, nil
+}
+
+func latestBackup() (string, error) {
+	backupDir := filepath.Join(installerHome(), "backups")
+	entries, err := os.ReadDir(backupDir)
+	if err != nil {
+		return "", err
+	}
+	var latest os.DirEntry
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".tar.gz") {
+			continue
+		}
+		if latest == nil || entry.Name() > latest.Name() {
+			latest = entry
+		}
+	}
+	if latest == nil {
+		return "", errors.New("backup tidak ditemukan")
+	}
+	return filepath.Join(backupDir, latest.Name()), nil
+}
+
+func restoreBackup(path string) error {
+	if _, err := os.Stat(path); err != nil {
+		return err
+	}
+	cmd := execCommand("tar", "xzf", path, "-C", "/")
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	return cmd.Run()
 }
 
 func ensureInstallerConfig() (InstallerConfig, error) {
@@ -414,57 +519,42 @@ func decryptPayload(name string) (string, error) {
 }
 
 func assignPorts() (PortAssignments, error) {
-	used := map[int]bool{}
-	pick := func(start, end int) (int, error) {
-		for port := start; port <= end; port++ {
-			if used[port] {
-				continue
-			}
-			if isPortAvailable(port) {
-				used[port] = true
-				return port, nil
-			}
-		}
-		return 0, fmt.Errorf("tidak ada port tersedia pada rentang %d-%d", start, end)
+	zivpnPort := 5667
+	if !isUDPAvailable(zivpnPort) {
+		return PortAssignments{}, fmt.Errorf("port UDP %d sudah digunakan", zivpnPort)
 	}
 
-	zivpnPort, err := pick(5667, 5699)
-	if err != nil {
-		return PortAssignments{}, err
+	xrayPort := 443
+	if !isTCPAvailable(xrayPort) {
+		return PortAssignments{}, fmt.Errorf("port TCP %d sudah digunakan", xrayPort)
 	}
-	vmessPort, err := pick(10000, 10050)
-	if err != nil {
-		return PortAssignments{}, err
-	}
-	vlessPort, err := pick(10051, 10100)
-	if err != nil {
-		return PortAssignments{}, err
-	}
-	trojanPort, err := pick(10101, 10150)
-	if err != nil {
-		return PortAssignments{}, err
-	}
-	hysteriaPort, err := pick(8443, 8499)
-	if err != nil {
-		return PortAssignments{}, err
+
+	hysteriaPort := 443
+	if !isUDPAvailable(hysteriaPort) {
+		return PortAssignments{}, fmt.Errorf("port UDP %d sudah digunakan", hysteriaPort)
 	}
 
 	return PortAssignments{
 		ZivpnPort:    zivpnPort,
-		VmessPort:    vmessPort,
-		VlessPort:    vlessPort,
-		TrojanPort:   trojanPort,
+		VmessPort:    xrayPort,
+		VlessPort:    xrayPort,
+		TrojanPort:   xrayPort,
 		HysteriaPort: hysteriaPort,
 	}, nil
 }
 
-func isPortAvailable(port int) bool {
+func isTCPAvailable(port int) bool {
 	addr := fmt.Sprintf(":%d", port)
 	listener, err := net.Listen("tcp", addr)
 	if err != nil {
 		return false
 	}
 	listener.Close()
+	return true
+}
+
+func isUDPAvailable(port int) bool {
+	addr := fmt.Sprintf(":%d", port)
 	packet, err := net.ListenPacket("udp", addr)
 	if err != nil {
 		return false
@@ -693,6 +783,11 @@ func handleAdminCommand(token string, message *telegramMessage) error {
 		return nil
 	}
 	text = normalizeAdminShortcut(text)
+
+	if handled, err := handleAdminSession(token, message.Chat.ID, text); handled {
+		return err
+	}
+
 	fields := strings.Fields(text)
 	command := strings.ToLower(fields[0])
 
@@ -708,18 +803,8 @@ func handleAdminCommand(token string, message *telegramMessage) error {
 			ReplyMarkup: adminMenuKeyboard(),
 		})
 	case "/create":
-		if len(fields) < 3 {
-			return sendTelegramMessage(token, message.Chat.ID, adminUsageText("Create"), &telegramMessageOptions{ParseMode: "HTML"})
-		}
-		months, err := parseInt(fields[2])
-		if err != nil || months <= 0 {
-			return sendTelegramMessage(token, message.Chat.ID, adminErrorText("Bulan tidak valid."), &telegramMessageOptions{ParseMode: "HTML"})
-		}
-		limit := 1
-		if len(fields) >= 4 {
-			limit, _ = parseInt(fields[3])
-		}
-		return createAccount(token, message.Chat.ID, fields[1], months, limit)
+		startAdminSession(message.Chat.ID, &adminSession{Step: "username"})
+		return sendTelegramMessage(token, message.Chat.ID, "<b>Buat Akun</b>\nMasukkan username:", &telegramMessageOptions{ParseMode: "HTML"})
 	case "/delete":
 		if len(fields) < 2 {
 			return sendTelegramMessage(token, message.Chat.ID, adminUsageText("Delete"), &telegramMessageOptions{ParseMode: "HTML"})
@@ -741,6 +826,24 @@ func handleAdminCommand(token string, message *telegramMessage) error {
 		return setAccountLimit(token, message.Chat.ID, fields[1], limit)
 	case "/list":
 		return listAccounts(token, message.Chat.ID)
+	case "/status":
+		return sendTelegramMessage(token, message.Chat.ID, formatServiceStatus(), &telegramMessageOptions{ParseMode: "HTML"})
+	case "/restart":
+		if len(fields) < 2 {
+			return sendTelegramMessage(token, message.Chat.ID, adminUsageText("Restart"), &telegramMessageOptions{ParseMode: "HTML"})
+		}
+		return restartService(token, message.Chat.ID, fields[1])
+	case "/backup":
+		return backupConfigs(token, message.Chat.ID)
+	case "/restore":
+		var target string
+		if len(fields) >= 2 {
+			target = fields[1]
+		}
+		return restoreConfigs(token, message.Chat.ID, target)
+	case "/cancel":
+		clearAdminSession(message.Chat.ID)
+		return sendTelegramMessage(token, message.Chat.ID, adminSuccessText("Sesi dibatalkan."), &telegramMessageOptions{ParseMode: "HTML"})
 	default:
 		return sendTelegramMessage(token, message.Chat.ID, adminErrorText("Perintah tidak dikenal. Ketik /help untuk bantuan."), &telegramMessageOptions{ParseMode: "HTML"})
 	}
@@ -751,11 +854,16 @@ func adminHelpText() string {
 		"<b>Admin Panel</b>",
 		"Kelola akun dengan perintah berikut:",
 		"",
-		"➕ <b>Create</b>  <code>/create username months [limit]</code>",
+		"➕ <b>Create</b>  <code>/create</code> (interaktif)",
 		"🗑️ <b>Delete</b>  <code>/delete username</code>",
 		"📅 <b>Set Expiry</b>  <code>/setexp username YYYY-MM-DD</code>",
 		"📱 <b>Set Limit</b>  <code>/setlimit username limit</code>",
 		"🧾 <b>List</b>  <code>/list</code>",
+		"📊 <b>Status</b>  <code>/status</code>",
+		"🔁 <b>Restart</b>  <code>/restart service</code>",
+		"💾 <b>Backup</b>  <code>/backup</code>",
+		"♻️ <b>Restore</b>  <code>/restore [file]</code>",
+		"❌ <b>Cancel</b>  <code>/cancel</code>",
 		"",
 		"Gunakan tombol menu untuk akses cepat.",
 	}
@@ -775,13 +883,15 @@ func adminWelcomeText() string {
 func adminUsageText(section string) string {
 	switch section {
 	case "Create":
-		return "<b>Format Create</b>\n<code>/create username months [limit]</code>\nContoh: <code>/create user1 1 2</code>"
+		return "<b>Format Create</b>\n<code>/create</code> (interaktif)"
 	case "Delete":
 		return "<b>Format Delete</b>\n<code>/delete username</code>"
 	case "SetExp":
 		return "<b>Format Set Expiry</b>\n<code>/setexp username YYYY-MM-DD</code>\nContoh: <code>/setexp user1 2025-01-31</code>"
 	case "SetLimit":
 		return "<b>Format Set Limit</b>\n<code>/setlimit username limit</code>\nContoh: <code>/setlimit user1 2</code>"
+	case "Restart":
+		return "<b>Format Restart</b>\n<code>/restart zivpn|xray|hysteria2|bot</code>"
 	default:
 		return ""
 	}
@@ -808,6 +918,17 @@ func adminMenuKeyboard() *telegramReplyMarkup {
 			},
 			{
 				{Text: "🗑️ Delete Account"},
+				{Text: "📊 Status"},
+			},
+			{
+				{Text: "🔁 Restart Service"},
+				{Text: "💾 Backup"},
+			},
+			{
+				{Text: "♻️ Restore"},
+				{Text: "❌ Cancel"},
+			},
+			{
 				{Text: "ℹ️ Help"},
 			},
 		},
@@ -822,6 +943,11 @@ func normalizeAdminShortcut(text string) string {
 		"📅 set expiry":       "/setexp",
 		"📱 set device limit": "/setlimit",
 		"🗑️ delete account":  "/delete",
+		"📊 status":           "/status",
+		"🔁 restart service":  "/restart",
+		"💾 backup":           "/backup",
+		"♻️ restore":         "/restore",
+		"❌ cancel":           "/cancel",
 		"ℹ️ help":            "/help",
 		"start":              "/start",
 		"menu":               "/menu",
@@ -835,21 +961,103 @@ func normalizeAdminShortcut(text string) string {
 	return text
 }
 
-func createAccount(token string, chatID int64, username string, months int, limit int) error {
+func protocolKeyboard() *telegramReplyMarkup {
+	return &telegramReplyMarkup{
+		Keyboard: [][]telegramKeyboardButton{
+			{
+				{Text: "ZIVPN"},
+				{Text: "VMESS"},
+				{Text: "VLESS"},
+			},
+			{
+				{Text: "TROJAN"},
+				{Text: "HYSTERIA2"},
+			},
+			{
+				{Text: "❌ Cancel"},
+			},
+		},
+		ResizeKeyboard: true,
+	}
+}
+
+func startAdminSession(chatID int64, session *adminSession) {
+	adminSessionsMu.Lock()
+	defer adminSessionsMu.Unlock()
+	adminSessions[chatID] = session
+}
+
+func clearAdminSession(chatID int64) {
+	adminSessionsMu.Lock()
+	defer adminSessionsMu.Unlock()
+	delete(adminSessions, chatID)
+}
+
+func handleAdminSession(token string, chatID int64, text string) (bool, error) {
+	adminSessionsMu.Lock()
+	session, ok := adminSessions[chatID]
+	adminSessionsMu.Unlock()
+	if !ok {
+		return false, nil
+	}
+	if strings.EqualFold(strings.TrimSpace(text), "/cancel") {
+		clearAdminSession(chatID)
+		return true, sendTelegramMessage(token, chatID, adminSuccessText("Sesi dibatalkan."), &telegramMessageOptions{ParseMode: "HTML"})
+	}
+
+	switch session.Step {
+	case "username":
+		if strings.HasPrefix(text, "/") {
+			return true, sendTelegramMessage(token, chatID, adminErrorText("Gunakan username tanpa slash atau /cancel."), &telegramMessageOptions{ParseMode: "HTML"})
+		}
+		session.Username = strings.TrimSpace(text)
+		session.Step = "days"
+		startAdminSession(chatID, session)
+		return true, sendTelegramMessage(token, chatID, "Masukkan masa aktif (hari), contoh: <code>30</code>", &telegramMessageOptions{ParseMode: "HTML"})
+	case "days":
+		days, err := parseInt(text)
+		if err != nil || days <= 0 {
+			return true, sendTelegramMessage(token, chatID, adminErrorText("Durasi hari tidak valid."), &telegramMessageOptions{ParseMode: "HTML"})
+		}
+		session.Days = days
+		session.Step = "protocol"
+		startAdminSession(chatID, session)
+		return true, sendTelegramMessage(token, chatID, "Pilih protocol:", &telegramMessageOptions{
+			ParseMode:   "HTML",
+			ReplyMarkup: protocolKeyboard(),
+		})
+	case "protocol":
+		protocol := strings.ToLower(strings.TrimSpace(text))
+		switch protocol {
+		case "zivpn", "vmess", "vless", "trojan", "hysteria2":
+			clearAdminSession(chatID)
+			return true, createAccount(token, chatID, session.Username, session.Days, 1, protocol)
+		default:
+			return true, sendTelegramMessage(token, chatID, adminErrorText("Protocol tidak valid. Pilih dari tombol."), &telegramMessageOptions{ParseMode: "HTML"})
+		}
+	default:
+		clearAdminSession(chatID)
+		return false, nil
+	}
+}
+
+func createAccount(token string, chatID int64, username string, days int, limit int, protocol string) error {
 	store, path, err := loadAccountStore()
 	if err != nil {
 		return err
 	}
 	entry := AccountEntry{
 		Username:    username,
-		ExpiresAt:   time.Now().AddDate(0, months, 0),
+		ExpiresAt:   time.Now().AddDate(0, 0, days),
 		DeviceLimit: limit,
+		Protocol:    protocol,
 	}
 	store.Accounts[username] = entry
 	if err := saveAccountStore(path, store); err != nil {
 		return err
 	}
-	message := fmt.Sprintf("Akun <b>%s</b> dibuat.\nExp: <b>%s</b>\nLimit: <b>%d device</b>", username, entry.ExpiresAt.Format("2006-01-02"), limit)
+	link := buildAccountLink(entry)
+	message := fmt.Sprintf("Akun <b>%s</b> dibuat.\nProtocol: <b>%s</b>\nExp: <b>%s</b>\nLimit: <b>%d device</b>\nLink:\n<code>%s</code>", username, strings.ToUpper(entry.Protocol), entry.ExpiresAt.Format("2006-01-02"), limit, link)
 	return sendTelegramMessage(token, chatID, adminSuccessText(message), &telegramMessageOptions{ParseMode: "HTML"})
 }
 
@@ -906,6 +1114,109 @@ func setAccountLimit(token string, chatID int64, username string, limit int) err
 	}
 	message := fmt.Sprintf("Limit <b>%s</b> diupdate ke <b>%d device</b>.", username, limit)
 	return sendTelegramMessage(token, chatID, adminSuccessText(message), &telegramMessageOptions{ParseMode: "HTML"})
+}
+
+func formatServiceStatus() string {
+	statuses := []string{
+		"<b>Status Service</b>",
+		formatUnitStatus("zivpn.service", "ZIVPN"),
+		formatUnitStatus("xray.service", "Xray"),
+		formatUnitStatus("hysteria2.service", "Hysteria2"),
+		formatUnitStatus("zivpn-installer-bot.service", "Bot"),
+	}
+	return strings.Join(statuses, "\n")
+}
+
+func formatUnitStatus(unit string, label string) string {
+	state := systemctlStatus(unit)
+	return fmt.Sprintf("%s: <b>%s</b>", label, state)
+}
+
+func systemctlStatus(unit string) string {
+	cmd := execCommand("systemctl", "is-active", unit)
+	output, err := cmd.Output()
+	if err != nil {
+		return "unknown"
+	}
+	return strings.TrimSpace(string(output))
+}
+
+func restartService(token string, chatID int64, name string) error {
+	unit := mapServiceName(name)
+	if unit == "" {
+		return sendTelegramMessage(token, chatID, adminErrorText("Service tidak dikenal."), &telegramMessageOptions{ParseMode: "HTML"})
+	}
+	cmd := execCommand("systemctl", "restart", unit)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		return sendTelegramMessage(token, chatID, adminErrorText(fmt.Sprintf("Gagal restart %s: %v", unit, err)), &telegramMessageOptions{ParseMode: "HTML"})
+	}
+	return sendTelegramMessage(token, chatID, adminSuccessText(fmt.Sprintf("Service %s direstart.", unit)), &telegramMessageOptions{ParseMode: "HTML"})
+}
+
+func mapServiceName(name string) string {
+	switch strings.ToLower(strings.TrimSpace(name)) {
+	case "zivpn":
+		return "zivpn.service"
+	case "xray":
+		return "xray.service"
+	case "hysteria2", "hysteria":
+		return "hysteria2.service"
+	case "bot", "telegram":
+		return "zivpn-installer-bot.service"
+	default:
+		return ""
+	}
+}
+
+func backupConfigs(token string, chatID int64) error {
+	backupPath, err := createBackup()
+	if err != nil {
+		return sendTelegramMessage(token, chatID, adminErrorText(fmt.Sprintf("Backup gagal: %v", err)), &telegramMessageOptions{ParseMode: "HTML"})
+	}
+	return sendTelegramMessage(token, chatID, adminSuccessText(fmt.Sprintf("Backup dibuat: <code>%s</code>", backupPath)), &telegramMessageOptions{ParseMode: "HTML"})
+}
+
+func restoreConfigs(token string, chatID int64, target string) error {
+	if target == "" {
+		latest, err := latestBackup()
+		if err != nil {
+			return sendTelegramMessage(token, chatID, adminErrorText("Backup tidak ditemukan."), &telegramMessageOptions{ParseMode: "HTML"})
+		}
+		target = latest
+	}
+	if err := restoreBackup(target); err != nil {
+		return sendTelegramMessage(token, chatID, adminErrorText(fmt.Sprintf("Restore gagal: %v", err)), &telegramMessageOptions{ParseMode: "HTML"})
+	}
+	return sendTelegramMessage(token, chatID, adminSuccessText(fmt.Sprintf("Restore selesai dari <code>%s</code>.", target)), &telegramMessageOptions{ParseMode: "HTML"})
+}
+
+func buildAccountLink(entry AccountEntry) string {
+	config, _, _ := loadInstallerConfig()
+	host := strings.TrimSpace(config.XrayDomain)
+	if host == "" {
+		if name, err := os.Hostname(); err == nil {
+			host = name
+		} else {
+			host = "server"
+		}
+	}
+
+	switch strings.ToLower(entry.Protocol) {
+	case "zivpn":
+		return fmt.Sprintf("zi://%s@%s:%d", entry.Username, host, 5667)
+	case "vmess":
+		return fmt.Sprintf("vmess://%s@%s:%d", entry.Username, host, 443)
+	case "vless":
+		return fmt.Sprintf("vless://%s@%s:%d", entry.Username, host, 443)
+	case "trojan":
+		return fmt.Sprintf("trojan://%s@%s:%d", entry.Username, host, 443)
+	case "hysteria2":
+		return fmt.Sprintf("hysteria2://%s@%s:%d", entry.Username, host, 443)
+	default:
+		return fmt.Sprintf("%s://%s@%s", entry.Protocol, entry.Username, host)
+	}
 }
 
 func listAccounts(token string, chatID int64) error {
@@ -1030,11 +1341,11 @@ func sendTelegramMessage(token string, chatID int64, message string, opts *teleg
 func formatAccountListHTML(accounts map[string]AccountEntry) string {
 	lines := []string{
 		"<b>Daftar Akun</b>",
-		"<pre>USERNAME           EXPIRY     LIMIT",
-		"------------------------------------</pre>",
+		"<pre>USERNAME           PROTO     EXPIRY     LIMIT",
+		"------------------------------------------------</pre>",
 	}
 	for _, entry := range accounts {
-		lines = append(lines, fmt.Sprintf("<pre>%-18s %-10s %5d</pre>", entry.Username, entry.ExpiresAt.Format("2006-01-02"), entry.DeviceLimit))
+		lines = append(lines, fmt.Sprintf("<pre>%-18s %-8s %-10s %5d</pre>", entry.Username, strings.ToUpper(entry.Protocol), entry.ExpiresAt.Format("2006-01-02"), entry.DeviceLimit))
 	}
 	lines = append(lines, "", "Gunakan <code>/help</code> untuk format perintah.")
 	return strings.Join(lines, "\n")
