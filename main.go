@@ -54,6 +54,12 @@ type AccountEntry struct {
 	DeviceLimit int       `json:"device_limit"`
 }
 
+type InstallerConfig struct {
+	TelegramBotToken string `json:"telegram_bot_token"`
+	TelegramAdminIDs string `json:"telegram_admin_ids"`
+	XrayDomain       string `json:"xray_domain"`
+}
+
 type PortAssignments struct {
 	ZivpnPort    int
 	VmessPort    int
@@ -82,6 +88,10 @@ func main() {
 		if err := runInstall(os.Args[2:]); err != nil {
 			exitError(err)
 		}
+	case "update":
+		if err := runUpdate(os.Args[2:]); err != nil {
+			exitError(err)
+		}
 	default:
 		printUsage()
 		os.Exit(1)
@@ -94,6 +104,7 @@ func printUsage() {
 	fmt.Println("  mint     Create activation token (1 month or 1 year)")
 	fmt.Println("  bot      Run Telegram admin bot for account management")
 	fmt.Println("  install  Run installer with activation token")
+	fmt.Println("  update   Pull latest repository changes and rebuild")
 }
 
 func mintToken(args []string) error {
@@ -187,6 +198,11 @@ func runInstall(args []string) error {
 		return err
 	}
 
+	config, err := ensureInstallerConfig()
+	if err != nil {
+		return err
+	}
+
 	notifyTelegram(fmt.Sprintf("Token aktif di %s (plan %s, berlaku sampai %s)", machineID, entry.Plan, entry.ExpiresAt.Format(time.RFC3339)))
 
 	ports, err := assignPorts()
@@ -202,8 +218,11 @@ func runInstall(args []string) error {
 		fmt.Sprintf("XRAY_TROJAN_PORT=%d", ports.TrojanPort),
 		fmt.Sprintf("XRAY_UUID=%s", newUUID()),
 		fmt.Sprintf("XRAY_TROJAN_PASSWORD=%s", randomPassword(14)),
+		fmt.Sprintf("XRAY_DOMAIN=%s", config.XrayDomain),
 		fmt.Sprintf("HYSTERIA_PORT=%d", ports.HysteriaPort),
 		fmt.Sprintf("HYSTERIA_PASSWORD=%s", randomPassword(14)),
+		fmt.Sprintf("TELEGRAM_BOT_TOKEN=%s", config.TelegramBotToken),
+		fmt.Sprintf("TELEGRAM_ADMIN_IDS=%s", config.TelegramAdminIDs),
 	}
 
 	if *dryRun {
@@ -231,6 +250,115 @@ func runInstall(args []string) error {
 	fmt.Printf("  Xray Trojan: %d\n", ports.TrojanPort)
 	fmt.Printf("  Hysteria2: %d\n", ports.HysteriaPort)
 	return nil
+}
+
+func runUpdate(args []string) error {
+	flags := flag.NewFlagSet("update", flag.ContinueOnError)
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+
+	repoPath := strings.TrimSpace(os.Getenv("INSTALLER_REPO"))
+	if repoPath == "" {
+		workingDir, err := os.Getwd()
+		if err != nil {
+			return err
+		}
+		repoPath = workingDir
+	}
+
+	if _, err := os.Stat(filepath.Join(repoPath, ".git")); err != nil {
+		return fmt.Errorf("repo git tidak ditemukan di %s (set INSTALLER_REPO)", repoPath)
+	}
+
+	fmt.Println("Menarik update terbaru...")
+	pull := execCommand("git", "-C", repoPath, "pull", "--ff-only")
+	pull.Stdout = os.Stdout
+	pull.Stderr = os.Stderr
+	if err := pull.Run(); err != nil {
+		return err
+	}
+
+	fmt.Println("Membangun ulang binary...")
+	build := execCommand("go", "build", "-o", "zivpn-installer", ".")
+	build.Dir = repoPath
+	build.Stdout = os.Stdout
+	build.Stderr = os.Stderr
+	if err := build.Run(); err != nil {
+		return err
+	}
+
+	fmt.Println("Update selesai.")
+	return nil
+}
+
+func ensureInstallerConfig() (InstallerConfig, error) {
+	config, path, err := loadInstallerConfig()
+	if err != nil {
+		return InstallerConfig{}, err
+	}
+
+	if envToken := strings.TrimSpace(os.Getenv("TELEGRAM_BOT_TOKEN")); envToken != "" {
+		config.TelegramBotToken = envToken
+	}
+	if envAdmins := strings.TrimSpace(os.Getenv("TELEGRAM_ADMIN_IDS")); envAdmins != "" {
+		config.TelegramAdminIDs = envAdmins
+	}
+	if envDomain := strings.TrimSpace(os.Getenv("XRAY_DOMAIN")); envDomain != "" {
+		config.XrayDomain = envDomain
+	}
+
+	reader := bufio.NewReader(os.Stdin)
+	if strings.TrimSpace(config.TelegramBotToken) == "" {
+		fmt.Print("Masukkan TELEGRAM_BOT_TOKEN (kosongkan jika tidak dipakai): ")
+		value, _ := reader.ReadString('\n')
+		config.TelegramBotToken = strings.TrimSpace(value)
+	}
+	if strings.TrimSpace(config.TelegramAdminIDs) == "" {
+		fmt.Print("Masukkan TELEGRAM_ADMIN_IDS (pisahkan dengan koma, kosongkan jika tidak dipakai): ")
+		value, _ := reader.ReadString('\n')
+		config.TelegramAdminIDs = strings.TrimSpace(value)
+	}
+	if strings.TrimSpace(config.XrayDomain) == "" {
+		fmt.Print("Masukkan domain untuk Xray (contoh: vpn.example.com): ")
+		value, _ := reader.ReadString('\n')
+		config.XrayDomain = strings.TrimSpace(value)
+	}
+
+	if err := saveInstallerConfig(path, config); err != nil {
+		return InstallerConfig{}, err
+	}
+	return config, nil
+}
+
+func loadInstallerConfig() (InstallerConfig, string, error) {
+	home := installerHome()
+	if err := os.MkdirAll(home, 0o700); err != nil {
+		return InstallerConfig{}, "", err
+	}
+	path := filepath.Join(home, "config.json")
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return InstallerConfig{}, path, nil
+		}
+		return InstallerConfig{}, "", err
+	}
+
+	var config InstallerConfig
+	if err := json.Unmarshal(data, &config); err != nil {
+		return InstallerConfig{}, "", err
+	}
+	return config, path, nil
+}
+
+func saveInstallerConfig(path string, config InstallerConfig) error {
+	data, err := json.MarshalIndent(config, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, data, 0o600)
 }
 
 func runPayload(name string, env []string) error {
@@ -433,10 +561,22 @@ func runTelegramBot(args []string) error {
 	}
 
 	token := strings.TrimSpace(os.Getenv("TELEGRAM_BOT_TOKEN"))
+	adminIDsValue := strings.TrimSpace(os.Getenv("TELEGRAM_ADMIN_IDS"))
+	if token == "" || adminIDsValue == "" {
+		config, _, err := loadInstallerConfig()
+		if err == nil {
+			if token == "" {
+				token = strings.TrimSpace(config.TelegramBotToken)
+			}
+			if adminIDsValue == "" {
+				adminIDsValue = strings.TrimSpace(config.TelegramAdminIDs)
+			}
+		}
+	}
 	if token == "" {
 		return errors.New("TELEGRAM_BOT_TOKEN belum diisi")
 	}
-	adminIDs := parseAdminIDs(os.Getenv("TELEGRAM_ADMIN_IDS"))
+	adminIDs := parseAdminIDs(adminIDsValue)
 	if len(adminIDs) == 0 {
 		return errors.New("TELEGRAM_ADMIN_IDS belum diisi (pisahkan dengan koma)")
 	}
@@ -825,6 +965,11 @@ func getMachineID() string {
 func notifyTelegram(message string) {
 	token := strings.TrimSpace(os.Getenv("TELEGRAM_BOT_TOKEN"))
 	chatID := strings.TrimSpace(os.Getenv("TELEGRAM_CHAT_ID"))
+	if token == "" {
+		if config, _, err := loadInstallerConfig(); err == nil {
+			token = strings.TrimSpace(config.TelegramBotToken)
+		}
+	}
 	if token == "" || chatID == "" {
 		return
 	}
