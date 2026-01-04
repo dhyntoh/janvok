@@ -26,6 +26,7 @@ Commands:
   bot      Run Telegram admin bot for account management
   install  Run installer with activation token
   update   Pull latest repository changes and rebuild
+  menu     Run interactive CLI menu
 ```
 
 ## Aktivasi Token
@@ -136,6 +137,16 @@ Gunakan perintah atau menu:
 Flow `/create` bersifat interaktif: bot akan menanyakan username, masa aktif (hari), lalu pilihan protocol dan mengirim link akun seperti `zi://`, `vless://`, dll.
 
 Data akun akan disimpan di `accounts.json` pada `INSTALLER_HOME`.
+
+## Menu Interaktif CLI (VPS)
+
+Jalankan menu di VPS:
+
+```bash
+./zivpn-installer menu
+```
+
+Menu ini menyediakan create/delete akun, backup/restore, status service, dan restart service.
 
 ## Variabel Lingkungan
 

@@ -105,6 +105,10 @@ func main() {
 		if err := runUpdate(os.Args[2:]); err != nil {
 			exitError(err)
 		}
+	case "menu":
+		if err := runMenu(os.Args[2:]); err != nil {
+			exitError(err)
+		}
 	default:
 		printUsage()
 		os.Exit(1)
@@ -118,6 +122,7 @@ func printUsage() {
 	fmt.Println("  bot      Run Telegram admin bot for account management")
 	fmt.Println("  install  Run installer with activation token")
 	fmt.Println("  update   Pull latest repository changes and rebuild")
+	fmt.Println("  menu     Run interactive CLI menu")
 }
 
 func mintToken(args []string) error {
@@ -305,6 +310,161 @@ func runUpdate(args []string) error {
 
 	fmt.Println("Update selesai.")
 	return nil
+}
+
+func runMenu(args []string) error {
+	flags := flag.NewFlagSet("menu", flag.ContinueOnError)
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+
+	reader := bufio.NewReader(os.Stdin)
+	for {
+		fmt.Println("")
+		fmt.Println("=== ZIVPN Installer Menu ===")
+		fmt.Println("1) Create account")
+		fmt.Println("2) Delete account")
+		fmt.Println("3) Restore configs")
+		fmt.Println("4) Backup configs")
+		fmt.Println("5) List accounts")
+		fmt.Println("6) Show service status")
+		fmt.Println("7) Restart service")
+		fmt.Println("8) Exit")
+		fmt.Print("Pilih menu: ")
+
+		choice, _ := reader.ReadString('\n')
+		choice = strings.TrimSpace(choice)
+
+		switch choice {
+		case "1":
+			if err := menuCreateAccount(reader); err != nil {
+				fmt.Println("Error:", err)
+			}
+		case "2":
+			if err := menuDeleteAccount(reader); err != nil {
+				fmt.Println("Error:", err)
+			}
+		case "3":
+			if err := menuRestore(reader); err != nil {
+				fmt.Println("Error:", err)
+			}
+		case "4":
+			if err := menuBackup(); err != nil {
+				fmt.Println("Error:", err)
+			}
+		case "5":
+			if err := menuListAccounts(); err != nil {
+				fmt.Println("Error:", err)
+			}
+		case "6":
+			fmt.Println(formatServiceStatus())
+		case "7":
+			if err := menuRestartService(reader); err != nil {
+				fmt.Println("Error:", err)
+			}
+		case "8":
+			fmt.Println("Keluar.")
+			return nil
+		default:
+			fmt.Println("Pilihan tidak dikenal.")
+		}
+	}
+}
+
+func menuCreateAccount(reader *bufio.Reader) error {
+	fmt.Print("Username: ")
+	username, _ := reader.ReadString('\n')
+	username = strings.TrimSpace(username)
+	if username == "" {
+		return errors.New("username tidak boleh kosong")
+	}
+	fmt.Print("Masa aktif (hari): ")
+	daysInput, _ := reader.ReadString('\n')
+	daysInput = strings.TrimSpace(daysInput)
+	days, err := parseInt(daysInput)
+	if err != nil || days <= 0 {
+		return errors.New("durasi hari tidak valid")
+	}
+	fmt.Print("Protocol (zivpn/vmess/vless/trojan/hysteria2): ")
+	protocol, _ := reader.ReadString('\n')
+	protocol = strings.ToLower(strings.TrimSpace(protocol))
+	switch protocol {
+	case "zivpn", "vmess", "vless", "trojan", "hysteria2":
+	default:
+		return errors.New("protocol tidak valid")
+	}
+	if err := createAccount("", 0, username, days, 1, protocol); err != nil {
+		return err
+	}
+	fmt.Println("Akun dibuat. Link:", buildAccountLink(AccountEntry{
+		Username: username,
+		Protocol: protocol,
+	}))
+	return nil
+}
+
+func menuDeleteAccount(reader *bufio.Reader) error {
+	fmt.Print("Username yang dihapus: ")
+	username, _ := reader.ReadString('\n')
+	username = strings.TrimSpace(username)
+	if username == "" {
+		return errors.New("username tidak boleh kosong")
+	}
+	store, path, err := loadAccountStore()
+	if err != nil {
+		return err
+	}
+	if _, ok := store.Accounts[username]; !ok {
+		return errors.New("akun tidak ditemukan")
+	}
+	delete(store.Accounts, username)
+	return saveAccountStore(path, store)
+}
+
+func menuRestore(reader *bufio.Reader) error {
+	fmt.Print("Path backup (kosong untuk terbaru): ")
+	path, _ := reader.ReadString('\n')
+	path = strings.TrimSpace(path)
+	if path == "" {
+		latest, err := latestBackup()
+		if err != nil {
+			return err
+		}
+		path = latest
+	}
+	return restoreBackup(path)
+}
+
+func menuBackup() error {
+	path, err := createBackup()
+	if err != nil {
+		return err
+	}
+	fmt.Println("Backup dibuat:", path)
+	return nil
+}
+
+func menuListAccounts() error {
+	store, _, err := loadAccountStore()
+	if err != nil {
+		return err
+	}
+	fmt.Println(formatAccountListText(store.Accounts))
+	return nil
+}
+
+func menuRestartService(reader *bufio.Reader) error {
+	fmt.Print("Service (zivpn/xray/hysteria2/bot): ")
+	service, _ := reader.ReadString('\n')
+	service = strings.TrimSpace(service)
+	unit := mapServiceName(service)
+	if unit == "" {
+		return errors.New("service tidak dikenal")
+	}
+	cmd := execCommand("systemctl", "restart", unit)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	return cmd.Run()
 }
 
 func setupBotService() error {
@@ -1058,6 +1218,10 @@ func createAccount(token string, chatID int64, username string, days int, limit 
 	}
 	link := buildAccountLink(entry)
 	message := fmt.Sprintf("Akun <b>%s</b> dibuat.\nProtocol: <b>%s</b>\nExp: <b>%s</b>\nLimit: <b>%d device</b>\nLink:\n<code>%s</code>", username, strings.ToUpper(entry.Protocol), entry.ExpiresAt.Format("2006-01-02"), limit, link)
+	if token == "" || chatID == 0 {
+		fmt.Println(message)
+		return nil
+	}
 	return sendTelegramMessage(token, chatID, adminSuccessText(message), &telegramMessageOptions{ParseMode: "HTML"})
 }
 
@@ -1348,6 +1512,21 @@ func formatAccountListHTML(accounts map[string]AccountEntry) string {
 		lines = append(lines, fmt.Sprintf("<pre>%-18s %-8s %-10s %5d</pre>", entry.Username, strings.ToUpper(entry.Protocol), entry.ExpiresAt.Format("2006-01-02"), entry.DeviceLimit))
 	}
 	lines = append(lines, "", "Gunakan <code>/help</code> untuk format perintah.")
+	return strings.Join(lines, "\n")
+}
+
+func formatAccountListText(accounts map[string]AccountEntry) string {
+	lines := []string{
+		"Daftar Akun",
+		"USERNAME           PROTO     EXPIRY     LIMIT",
+		"------------------------------------------------",
+	}
+	for _, entry := range accounts {
+		lines = append(lines, fmt.Sprintf("%-18s %-8s %-10s %5d", entry.Username, strings.ToUpper(entry.Protocol), entry.ExpiresAt.Format("2006-01-02"), entry.DeviceLimit))
+	}
+	if len(accounts) == 0 {
+		lines = append(lines, "(belum ada akun)")
+	}
 	return strings.Join(lines, "\n")
 }
 
