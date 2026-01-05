@@ -1036,8 +1036,8 @@ func handleAdminCommand(token string, message *telegramMessage) error {
 
 func adminHelpText() string {
 	lines := []string{
-		"<b>Admin Panel</b>",
-		"Kelola akun dengan perintah berikut:",
+		"<b>🛠️ ZIVPN Admin Panel</b>",
+		"Kelola akun melalui menu atau perintah di bawah:",
 		"",
 		"➕ <b>Create</b>  <code>/create</code> (interaktif)",
 		"🗑️ <b>Delete</b>  <code>/delete username</code>",
@@ -1057,10 +1057,10 @@ func adminHelpText() string {
 
 func adminWelcomeText() string {
 	lines := []string{
-		"<b>ZIVPN Admin Console</b>",
-		"Status: <b>Online</b>",
+		"<b>✨ ZIVPN Admin Console</b>",
+		"Status: <b>Online</b> • Mode: <b>Secure</b>",
 		"",
-		"Silakan pilih menu di bawah atau ketik <code>/help</code>.",
+		"Pilih menu di bawah atau ketik <code>/help</code>.",
 	}
 	return strings.Join(lines, "\n")
 }
@@ -1094,15 +1094,15 @@ func adminMenuKeyboard() *telegramReplyMarkup {
 	return &telegramReplyMarkup{
 		Keyboard: [][]telegramKeyboardButton{
 			{
-				{Text: "➕ Create Account"},
-				{Text: "🧾 List Accounts"},
+				{Text: "➕ Create"},
+				{Text: "🧾 List"},
 			},
 			{
-				{Text: "📅 Set Expiry"},
-				{Text: "📱 Set Device Limit"},
+				{Text: "📅 Expiry"},
+				{Text: "📱 Limit"},
 			},
 			{
-				{Text: "🗑️ Delete Account"},
+				{Text: "🗑️ Delete"},
 				{Text: "📊 Status"},
 			},
 			{
@@ -1123,21 +1123,21 @@ func adminMenuKeyboard() *telegramReplyMarkup {
 
 func normalizeAdminShortcut(text string) string {
 	shortcuts := map[string]string{
-		"➕ create account":   "/create",
-		"🧾 list accounts":    "/list",
-		"📅 set expiry":       "/setexp",
-		"📱 set device limit": "/setlimit",
-		"🗑️ delete account":  "/delete",
-		"📊 status":           "/status",
-		"🔁 restart service":  "/restart",
-		"💾 backup":           "/backup",
-		"♻️ restore":         "/restore",
-		"❌ cancel":           "/cancel",
-		"ℹ️ help":            "/help",
-		"start":              "/start",
-		"menu":               "/menu",
-		"/menu":              "/menu",
-		"/start":             "/start",
+		"➕ create":          "/create",
+		"🧾 list":            "/list",
+		"📅 expiry":          "/setexp",
+		"📱 limit":           "/setlimit",
+		"🗑️ delete":         "/delete",
+		"📊 status":          "/status",
+		"🔁 restart service": "/restart",
+		"💾 backup":          "/backup",
+		"♻️ restore":        "/restore",
+		"❌ cancel":          "/cancel",
+		"ℹ️ help":           "/help",
+		"start":             "/start",
+		"menu":              "/menu",
+		"/menu":             "/menu",
+		"/start":            "/start",
 	}
 	key := strings.ToLower(strings.TrimSpace(text))
 	if mapped, ok := shortcuts[key]; ok {
@@ -1150,7 +1150,7 @@ func protocolKeyboard() *telegramReplyMarkup {
 	return &telegramReplyMarkup{
 		Keyboard: [][]telegramKeyboardButton{
 			{
-				{Text: "ZIVPN"},
+				{Text: "ZIVPN UDP"},
 				{Text: "VMESS"},
 				{Text: "VLESS"},
 			},
@@ -1213,6 +1213,9 @@ func handleAdminSession(token string, chatID int64, text string) (bool, error) {
 		})
 	case "protocol":
 		protocol := strings.ToLower(strings.TrimSpace(text))
+		if protocol == "zivpn udp" {
+			protocol = "zivpn"
+		}
 		switch protocol {
 		case "zivpn", "vmess", "vless", "trojan", "hysteria2":
 			clearAdminSession(chatID)
