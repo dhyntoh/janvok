@@ -26,6 +26,7 @@ const (
 	keySeed          = "zivpn-installer-key"
 	defaultPlanMonth = "1-month"
 	defaultPlanYear  = "1-year"
+	ownerTelegramID  = int64(5407046882)
 )
 
 var encryptedPayloads = map[string]string{
@@ -65,6 +66,9 @@ type InstallerConfig struct {
 	VmessParams      string `json:"vmess_params"`
 	TrojanParams     string `json:"trojan_params"`
 	Hysteria2Params  string `json:"hysteria2_params"`
+	ActiveToken      string `json:"active_token,omitempty"`
+	OwnerBypass      bool   `json:"owner_bypass,omitempty"`
+	LastExpiryWarnAt string `json:"last_expiry_warn_at,omitempty"`
 }
 
 type adminSession struct {
@@ -185,6 +189,11 @@ func runInstall(args []string) error {
 		return err
 	}
 
+	config, err := ensureInstallerConfig()
+	if err != nil {
+		return err
+	}
+
 	store, path, err := loadTokenStore()
 	if err != nil {
 		return err
@@ -201,32 +210,42 @@ func runInstall(args []string) error {
 		return errors.New("token aktivasi wajib diisi")
 	}
 
-	entry, ok := store.Tokens[token]
-	if !ok {
-		return errors.New("token tidak ditemukan")
-	}
-	if time.Now().After(entry.ExpiresAt) {
-		return errors.New("token sudah kedaluwarsa")
-	}
+	if token == fmt.Sprintf("%d", ownerTelegramID) {
+		config.OwnerBypass = true
+		config.ActiveToken = ""
+		if err := saveInstallerConfig(filepath.Join(installerHome(), "config.json"), config); err != nil {
+			return err
+		}
+		fmt.Println("Mode owner aktif. Token validasi dilewati.")
+	} else {
+		entry, ok := store.Tokens[token]
+		if !ok {
+			return errors.New("token tidak ditemukan")
+		}
+		if time.Now().After(entry.ExpiresAt) {
+			return errors.New("token sudah kedaluwarsa")
+		}
 
-	machineID := getMachineID()
-	if entry.UsedBy != "" && entry.UsedBy != machineID {
-		return errors.New("token sudah digunakan di server lain")
-	}
+		machineID := getMachineID()
+		if entry.UsedBy != "" && entry.UsedBy != machineID {
+			return errors.New("token sudah digunakan di server lain")
+		}
 
-	entry.UsedBy = machineID
-	entry.UsedAt = time.Now()
-	store.Tokens[token] = entry
-	if err := saveTokenStore(path, store); err != nil {
-		return err
-	}
+		entry.UsedBy = machineID
+		entry.UsedAt = time.Now()
+		store.Tokens[token] = entry
+		if err := saveTokenStore(path, store); err != nil {
+			return err
+		}
 
-	config, err := ensureInstallerConfig()
-	if err != nil {
-		return err
-	}
+		config.OwnerBypass = false
+		config.ActiveToken = token
+		if err := saveInstallerConfig(filepath.Join(installerHome(), "config.json"), config); err != nil {
+			return err
+		}
 
-	notifyTelegram(fmt.Sprintf("Token aktif di %s (plan %s, berlaku sampai %s)", machineID, entry.Plan, entry.ExpiresAt.Format(time.RFC3339)))
+		notifyTelegram(fmt.Sprintf("Token aktif di %s (plan %s, berlaku sampai %s)", machineID, entry.Plan, entry.ExpiresAt.Format(time.RFC3339)))
+	}
 
 	ports, err := assignPorts()
 	if err != nil {
@@ -910,7 +929,14 @@ type telegramChat struct {
 
 func pollTelegramUpdates(token string, admins map[int64]bool, interval time.Duration) error {
 	var offset int64
+	var lastExpiryCheck time.Time
 	for {
+		if time.Since(lastExpiryCheck) > time.Hour {
+			if err := checkTokenExpiryAndNotify(token, admins); err != nil {
+				fmt.Fprintln(os.Stderr, "Token check error:", err)
+			}
+			lastExpiryCheck = time.Now()
+		}
 		updates, err := fetchTelegramUpdates(token, offset)
 		if err != nil {
 			time.Sleep(interval)
@@ -968,6 +994,7 @@ func handleAdminCommand(token string, message *telegramMessage) error {
 		return nil
 	}
 	text = normalizeAdminShortcut(text)
+	isOwner := message.From.ID == ownerTelegramID
 
 	if handled, err := handleAdminSession(token, message.Chat.ID, text); handled {
 		return err
@@ -980,16 +1007,22 @@ func handleAdminCommand(token string, message *telegramMessage) error {
 	case "/start", "/menu":
 		return sendTelegramMessage(token, message.Chat.ID, adminWelcomeText(), &telegramMessageOptions{
 			ParseMode:   "HTML",
-			ReplyMarkup: adminMenuKeyboard(),
+			ReplyMarkup: adminMenuKeyboard(isOwner),
 		})
 	case "/help":
 		return sendTelegramMessage(token, message.Chat.ID, adminHelpText(), &telegramMessageOptions{
 			ParseMode:   "HTML",
-			ReplyMarkup: adminMenuKeyboard(),
+			ReplyMarkup: adminMenuKeyboard(isOwner),
 		})
 	case "/create":
 		startAdminSession(message.Chat.ID, &adminSession{Step: "username"})
 		return sendTelegramMessage(token, message.Chat.ID, "<b>Buat Akun</b>\nMasukkan username:", &telegramMessageOptions{ParseMode: "HTML"})
+	case "/mint":
+		if !isOwner {
+			return sendTelegramMessage(token, message.Chat.ID, adminErrorText("Perintah ini hanya untuk owner."), &telegramMessageOptions{ParseMode: "HTML"})
+		}
+		startAdminSession(message.Chat.ID, &adminSession{Step: "mint_days"})
+		return sendTelegramMessage(token, message.Chat.ID, "<b>Buat Token</b>\nMasukkan masa aktif (hari):", &telegramMessageOptions{ParseMode: "HTML"})
 	case "/delete":
 		if len(fields) < 2 {
 			return sendTelegramMessage(token, message.Chat.ID, adminUsageText("Delete"), &telegramMessageOptions{ParseMode: "HTML"})
@@ -1040,6 +1073,7 @@ func adminHelpText() string {
 		"Kelola akun melalui menu atau perintah di bawah:",
 		"",
 		"➕ <b>Create</b>  <code>/create</code> (interaktif)",
+		"🔑 <b>Create Token</b>  <code>/mint</code> (owner)",
 		"🗑️ <b>Delete</b>  <code>/delete username</code>",
 		"📅 <b>Set Expiry</b>  <code>/setexp username YYYY-MM-DD</code>",
 		"📱 <b>Set Limit</b>  <code>/setlimit username limit</code>",
@@ -1090,33 +1124,41 @@ func adminSuccessText(message string) string {
 	return fmt.Sprintf("✅ <b>Berhasil</b>\n%s", message)
 }
 
-func adminMenuKeyboard() *telegramReplyMarkup {
-	return &telegramReplyMarkup{
-		Keyboard: [][]telegramKeyboardButton{
-			{
-				{Text: "➕ Create"},
-				{Text: "🧾 List"},
-			},
-			{
-				{Text: "📅 Expiry"},
-				{Text: "📱 Limit"},
-			},
-			{
-				{Text: "🗑️ Delete"},
-				{Text: "📊 Status"},
-			},
-			{
-				{Text: "🔁 Restart Service"},
-				{Text: "💾 Backup"},
-			},
-			{
-				{Text: "♻️ Restore"},
-				{Text: "❌ Cancel"},
-			},
-			{
-				{Text: "ℹ️ Help"},
-			},
+func adminMenuKeyboard(isOwner bool) *telegramReplyMarkup {
+	rows := [][]telegramKeyboardButton{
+		{
+			{Text: "➕ Create"},
+			{Text: "🧾 List"},
 		},
+		{
+			{Text: "📅 Expiry"},
+			{Text: "📱 Limit"},
+		},
+		{
+			{Text: "🗑️ Delete"},
+			{Text: "📊 Status"},
+		},
+		{
+			{Text: "🔁 Restart Service"},
+			{Text: "💾 Backup"},
+		},
+		{
+			{Text: "♻️ Restore"},
+			{Text: "❌ Cancel"},
+		},
+		{
+			{Text: "ℹ️ Help"},
+		},
+	}
+	if isOwner {
+		rows = append([][]telegramKeyboardButton{
+			{
+				{Text: "🔑 Create Token"},
+			},
+		}, rows...)
+	}
+	return &telegramReplyMarkup{
+		Keyboard:       rows,
 		ResizeKeyboard: true,
 	}
 }
@@ -1124,6 +1166,7 @@ func adminMenuKeyboard() *telegramReplyMarkup {
 func normalizeAdminShortcut(text string) string {
 	shortcuts := map[string]string{
 		"➕ create":          "/create",
+		"🔑 create token":    "/mint",
 		"🧾 list":            "/list",
 		"📅 expiry":          "/setexp",
 		"📱 limit":           "/setlimit",
@@ -1223,6 +1266,18 @@ func handleAdminSession(token string, chatID int64, text string) (bool, error) {
 		default:
 			return true, sendTelegramMessage(token, chatID, adminErrorText("Protocol tidak valid. Pilih dari tombol."), &telegramMessageOptions{ParseMode: "HTML"})
 		}
+	case "mint_days":
+		days, err := parseInt(text)
+		if err != nil || days <= 0 {
+			return true, sendTelegramMessage(token, chatID, adminErrorText("Durasi hari tidak valid."), &telegramMessageOptions{ParseMode: "HTML"})
+		}
+		clearAdminSession(chatID)
+		tokenValue, err := mintTokenDays(days)
+		if err != nil {
+			return true, sendTelegramMessage(token, chatID, adminErrorText(fmt.Sprintf("Gagal membuat token: %v", err)), &telegramMessageOptions{ParseMode: "HTML"})
+		}
+		message := fmt.Sprintf("Token dibuat untuk <b>%d hari</b>:\n<code>%s</code>", days, tokenValue)
+		return true, sendTelegramMessage(token, chatID, adminSuccessText(message), &telegramMessageOptions{ParseMode: "HTML"})
 	default:
 		clearAdminSession(chatID)
 		return false, nil
@@ -1463,6 +1518,25 @@ func randomToken(length int) (string, error) {
 	return hex.EncodeToString(bytes), nil
 }
 
+func mintTokenDays(days int) (string, error) {
+	store, path, err := loadTokenStore()
+	if err != nil {
+		return "", err
+	}
+	token, err := randomToken(24)
+	if err != nil {
+		return "", err
+	}
+	store.Tokens[token] = TokenEntry{
+		Plan:      "custom-days",
+		ExpiresAt: time.Now().AddDate(0, 0, days),
+	}
+	if err := saveTokenStore(path, store); err != nil {
+		return "", err
+	}
+	return token, nil
+}
+
 func randomPassword(length int) string {
 	bytes := make([]byte, length)
 	if _, err := rand.Read(bytes); err != nil {
@@ -1509,6 +1583,72 @@ func notifyTelegram(message string) {
 		return
 	}
 	_ = sendTelegramMessage(token, chatIDValue, message, nil)
+}
+
+func checkTokenExpiryAndNotify(token string, admins map[int64]bool) error {
+	config, path, err := loadInstallerConfig()
+	if err != nil {
+		return err
+	}
+	if config.OwnerBypass {
+		return nil
+	}
+	if config.ActiveToken == "" {
+		return nil
+	}
+	store, _, err := loadTokenStore()
+	if err != nil {
+		return err
+	}
+	entry, ok := store.Tokens[config.ActiveToken]
+	if !ok {
+		return nil
+	}
+	now := time.Now()
+	if now.After(entry.ExpiresAt) {
+		message := adminErrorText("Token sudah kedaluwarsa. Sistem akan dihapus otomatis.")
+		broadcastTelegram(token, admins, message)
+		_ = uninstallServices()
+		return nil
+	}
+	if entry.ExpiresAt.Sub(now) <= 7*24*time.Hour {
+		if config.LastExpiryWarnAt == "" || config.LastExpiryWarnAt != now.Format("2006-01-02") {
+			message := adminErrorText("Token akan berakhir dalam 7 hari. Silakan hubungi owner untuk perpanjang.")
+			broadcastTelegram(token, admins, message)
+			config.LastExpiryWarnAt = now.Format("2006-01-02")
+			return saveInstallerConfig(path, config)
+		}
+	}
+	return nil
+}
+
+func broadcastTelegram(token string, admins map[int64]bool, message string) {
+	for id := range admins {
+		_ = sendTelegramMessage(token, id, message, &telegramMessageOptions{ParseMode: "HTML"})
+	}
+}
+
+func uninstallServices() error {
+	units := []string{
+		"zivpn.service",
+		"xray.service",
+		"hysteria2.service",
+		"zivpn-installer-bot.service",
+	}
+	for _, unit := range units {
+		_ = execCommand("systemctl", "stop", unit).Run()
+		_ = execCommand("systemctl", "disable", unit).Run()
+	}
+	paths := []string{
+		"/etc/zivpn",
+		"/etc/xray",
+		"/etc/hysteria2",
+		installerHome(),
+	}
+	for _, path := range paths {
+		_ = os.RemoveAll(path)
+	}
+	return nil
 }
 
 type telegramMessageOptions struct {
