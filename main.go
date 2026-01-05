@@ -54,12 +54,17 @@ type AccountEntry struct {
 	ExpiresAt   time.Time `json:"expires_at"`
 	DeviceLimit int       `json:"device_limit"`
 	Protocol    string    `json:"protocol"`
+	Credential  string    `json:"credential,omitempty"`
 }
 
 type InstallerConfig struct {
 	TelegramBotToken string `json:"telegram_bot_token"`
 	TelegramAdminIDs string `json:"telegram_admin_ids"`
 	XrayDomain       string `json:"xray_domain"`
+	VlessParams      string `json:"vless_params"`
+	VmessParams      string `json:"vmess_params"`
+	TrojanParams     string `json:"trojan_params"`
+	Hysteria2Params  string `json:"hysteria2_params"`
 }
 
 type adminSession struct {
@@ -588,6 +593,26 @@ func ensureInstallerConfig() (InstallerConfig, error) {
 		fmt.Print("Masukkan domain untuk Xray (contoh: vpn.example.com): ")
 		value, _ := reader.ReadString('\n')
 		config.XrayDomain = strings.TrimSpace(value)
+	}
+	if strings.TrimSpace(config.VlessParams) == "" {
+		fmt.Print("Masukkan query VLESS (contoh: encryption=none&security=reality&fp=chrome&type=tcp&flow=xtls-rprx-vision): ")
+		value, _ := reader.ReadString('\n')
+		config.VlessParams = strings.TrimSpace(value)
+	}
+	if strings.TrimSpace(config.VmessParams) == "" {
+		fmt.Print("Masukkan query VMESS (contoh: type=tcp&security=tls&fp=chrome): ")
+		value, _ := reader.ReadString('\n')
+		config.VmessParams = strings.TrimSpace(value)
+	}
+	if strings.TrimSpace(config.TrojanParams) == "" {
+		fmt.Print("Masukkan query TROJAN (contoh: security=tls&type=tcp&fp=chrome): ")
+		value, _ := reader.ReadString('\n')
+		config.TrojanParams = strings.TrimSpace(value)
+	}
+	if strings.TrimSpace(config.Hysteria2Params) == "" {
+		fmt.Print("Masukkan query Hysteria2 (contoh: insecure=1&obfs=salamander): ")
+		value, _ := reader.ReadString('\n')
+		config.Hysteria2Params = strings.TrimSpace(value)
 	}
 
 	if err := saveInstallerConfig(path, config); err != nil {
@@ -1212,6 +1237,7 @@ func createAccount(token string, chatID int64, username string, days int, limit 
 		DeviceLimit: limit,
 		Protocol:    protocol,
 	}
+	entry.Credential = accountCredential(entry)
 	store.Accounts[username] = entry
 	if err := saveAccountStore(path, store); err != nil {
 		return err
@@ -1366,20 +1392,42 @@ func buildAccountLink(entry AccountEntry) string {
 			host = "server"
 		}
 	}
+	credential := entry.Credential
+	if credential == "" {
+		credential = entry.Username
+	}
 
 	switch strings.ToLower(entry.Protocol) {
 	case "zivpn":
-		return fmt.Sprintf("zi://%s@%s:%d", entry.Username, host, 5667)
+		return fmt.Sprintf("zi://%s@%s:%d#%s", credential, host, 5667, entry.Username)
 	case "vmess":
-		return fmt.Sprintf("vmess://%s@%s:%d", entry.Username, host, 443)
+		return buildLinkWithParams("vmess", credential, host, 443, config.VmessParams, entry.Username)
 	case "vless":
-		return fmt.Sprintf("vless://%s@%s:%d", entry.Username, host, 443)
+		return buildLinkWithParams("vless", credential, host, 443, config.VlessParams, entry.Username)
 	case "trojan":
-		return fmt.Sprintf("trojan://%s@%s:%d", entry.Username, host, 443)
+		return buildLinkWithParams("trojan", credential, host, 443, config.TrojanParams, entry.Username)
 	case "hysteria2":
-		return fmt.Sprintf("hysteria2://%s@%s:%d", entry.Username, host, 443)
+		return buildLinkWithParams("hysteria2", credential, host, 443, config.Hysteria2Params, entry.Username)
 	default:
-		return fmt.Sprintf("%s://%s@%s", entry.Protocol, entry.Username, host)
+		return fmt.Sprintf("%s://%s@%s#%s", entry.Protocol, credential, host, entry.Username)
+	}
+}
+
+func buildLinkWithParams(protocol string, credential string, host string, port int, params string, label string) string {
+	params = strings.TrimPrefix(strings.TrimSpace(params), "?")
+	base := fmt.Sprintf("%s://%s@%s:%d", protocol, credential, host, port)
+	if params == "" {
+		return fmt.Sprintf("%s#%s", base, label)
+	}
+	return fmt.Sprintf("%s?%s#%s", base, params, label)
+}
+
+func accountCredential(entry AccountEntry) string {
+	switch strings.ToLower(entry.Protocol) {
+	case "vmess", "vless", "trojan", "hysteria2":
+		return newUUID()
+	default:
+		return entry.Username
 	}
 }
 

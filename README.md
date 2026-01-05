@@ -60,6 +60,7 @@ Atau masukkan token saat diminta. Setelah token valid, installer akan meminta in
 - `TELEGRAM_BOT_TOKEN`
 - `TELEGRAM_ADMIN_IDS`
 - domain Xray (`XRAY_DOMAIN`)
+- query string untuk link akun (`VLESS/VMESS/TROJAN/HYSTERIA2`)
 
 Konfigurasi akan disimpan di `INSTALLER_HOME/config.json` dan digunakan kembali.
 
@@ -135,6 +136,7 @@ Gunakan perintah atau menu:
 ```
 
 Flow `/create` bersifat interaktif: bot akan menanyakan username, masa aktif (hari), lalu pilihan protocol dan mengirim link akun seperti `zi://`, `vless://`, dll.
+Link protocol Xray/Hysteria2 akan memakai parameter query yang disimpan di `INSTALLER_HOME/config.json`.
 
 Data akun akan disimpan di `accounts.json` pada `INSTALLER_HOME`.
 
