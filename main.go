@@ -1324,11 +1324,15 @@ func formatUnitStatus(unit string, label string) string {
 
 func systemctlStatus(unit string) string {
 	cmd := execCommand("systemctl", "is-active", unit)
-	output, err := cmd.Output()
+	output, err := cmd.CombinedOutput()
+	result := strings.TrimSpace(string(output))
+	if result != "" {
+		return result
+	}
 	if err != nil {
 		return "unknown"
 	}
-	return strings.TrimSpace(string(output))
+	return "unknown"
 }
 
 func restartService(token string, chatID int64, name string) error {
